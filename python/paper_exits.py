@@ -22,6 +22,9 @@ SCHEMA = [
     id INTEGER PRIMARY KEY, mode TEXT NOT NULL, plan_id TEXT NOT NULL,
     event_key TEXT NOT NULL UNIQUE, event TEXT NOT NULL, at TEXT NOT NULL,
     details TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS paper_data_conflicts (
+    mode TEXT NOT NULL, symbol TEXT NOT NULL, observed_at TEXT NOT NULL,
+    reason TEXT NOT NULL, PRIMARY KEY(mode,symbol,observed_at))""",
 ]
 
 
@@ -43,7 +46,17 @@ def _write(conn, mode, ident, state):
 
 def _view(row):
     body, state = json.loads(row["payload"]), json.loads(row["state"])
+    state.pop("_consumed_quote_keys", None)
     return dict(body, **state, simulation_only=True, validated_edge=False)
+
+
+def _remember_information(state, *times):
+    """Persist the latest receipt/resolution time, including legacy state defaults."""
+    p = _p()
+    times = [value for value in (state.get("information_available_at"), *times) if value]
+    if times:
+        state["information_available_at"] = p._stamp(max(map(p._time, times)))
+    return state.get("information_available_at")
 
 
 def configure_exit_plan(conn, data):
@@ -117,14 +130,15 @@ def configure_exit_plan(conn, data):
         state = {"status": "active", "remaining_quantity": quantity, "high_water_mark": None,
                  "trailing_active": False, "completed_stages": [], "pending_decision_id": None,
                  "block_reason": "await_strictly_later_qualified_quote", "last_observed_at": None,
-                 "intent": None, "attempt": 0, "exchange": lots[0]["exchange"], "information_available_at": None}
+                 "intent": None, "attempt": 0, "exchange": lots[0]["exchange"], "information_available_at": None,
+                 "_consumed_quote_keys": []}
         conn.execute("INSERT INTO paper_exit_plans VALUES(?,?,?,?,?,?,?)",
                      (mode, ident, symbol, digest, p._json(body), p._json(state), state["status"]))
         _event(conn, mode, ident, "plan_created", p._stamp(submitted), {"plan": body, "test_only": True}, "create")
-        return dict(body, **state, simulation_only=True, validated_edge=False)
+        return _view(conn.execute("SELECT * FROM paper_exit_plans WHERE mode=? AND plan_id=?", (mode, ident)).fetchone())
 
 
-def _sync(conn, row, at):
+def _sync(conn, row, at, received_at=None):
     """Reconcile filled/rejected child order; decrement only after a durable fill."""
     p = _p()
     state = json.loads(row["state"])
@@ -138,6 +152,12 @@ def _sync(conn, row, at):
         fill = conn.execute("SELECT * FROM paper_fills WHERE decision_pk=?", (order["id"],)).fetchone()
         if fill is None or fill["quantity"] > state["remaining_quantity"]:
             raise ValueError("exit plan ledger inconsistent: fill/remaining quantity")
+        # The next child depends on this fill's quantity, which is only knowable
+        # once its execution quote has arrived, not merely at its observation.
+        quote = conn.execute("SELECT payload FROM paper_quotes WHERE quote_key=?", (fill["quote_key"],)).fetchone()
+        if quote is None:
+            raise ValueError("exit plan ledger inconsistent: missing fill quote")
+        _remember_information(state, at, received_at, json.loads(quote["payload"])["received_at"])
         state["remaining_quantity"] -= fill["quantity"]
         if state["intent"]["kind"] == "stage":
             state["completed_stages"].append(state["intent"]["stage_index"])
@@ -149,6 +169,7 @@ def _sync(conn, row, at):
         if state["remaining_quantity"] == 0:
             state["status"] = "completed"
     elif order["status"] in {"rejected", "cancelled"}:
+        _remember_information(state, at, received_at)
         state["pending_decision_id"] = None
         state["block_reason"] = order["block_reason"]
         _event(conn, row["mode"], row["plan_id"], "exit_order_rejected", at,
@@ -164,6 +185,55 @@ def _sync(conn, row, at):
 def sync_all(conn, mode, at):
     for row in conn.execute("SELECT * FROM paper_exit_plans WHERE mode=? AND status='active'", (mode,)).fetchall():
         _sync(conn, row, at)
+
+
+def quarantine_ambiguous_history(conn, mode, at):
+    """Stop plans whose consumed evidence became ambiguous, before any new fill.
+
+    New plans retain exact quote provenance. Older persisted states have no
+    tracker, so their consumed observation interval is treated conservatively.
+    This never rewrites fills or releases the plan's manual-trading exclusion.
+    """
+    reason = "ambiguous_prior_quote_requires_cancel"
+    ambiguous = conn.execute("""SELECT q.symbol,q.observed_at,q.quote_key FROM paper_quotes q
+        JOIN (SELECT symbol,observed_at FROM paper_quotes WHERE mode=?
+              GROUP BY symbol,observed_at HAVING COUNT(*)>1) conflicts
+        ON q.symbol=conflicts.symbol AND q.observed_at=conflicts.observed_at
+        WHERE q.mode=? ORDER BY q.observed_at,q.quote_key""", (mode, mode)).fetchall()
+    if not ambiguous:
+        return
+    p = _p()
+    # Surface ambiguity in already-used valuations/fills even without an active
+    # plan. Unconsumed quotes quarantined on first sight are not retrospective
+    # data conflicts. These warnings persist after marks move on or disappear.
+    consumed_keys = {row["quote_key"] for row in conn.execute(
+        "SELECT quote_key FROM paper_marks WHERE mode=? UNION SELECT quote_key FROM paper_fills WHERE mode=?",
+        (mode, mode)).fetchall()}
+    conflicts = {(q["symbol"], q["observed_at"]) for q in ambiguous if q["quote_key"] in consumed_keys}
+    for row in conn.execute("SELECT * FROM paper_exit_plans WHERE mode=? AND status='active'", (mode,)).fetchall():
+        state = json.loads(row["state"])
+        if not state["last_observed_at"]:
+            continue
+        body = json.loads(row["payload"])
+        consumed = set(state["_consumed_quote_keys"]) if "_consumed_quote_keys" in state else None
+        affected = [q for q in ambiguous if q["symbol"] == row["symbol"] and
+                    p._time(body["submitted_at"]) < p._time(q["observed_at"]) <= p._time(state["last_observed_at"]) and
+                    (consumed is None or q["quote_key"] in consumed)]
+        conflicts.update((q["symbol"], q["observed_at"]) for q in affected)
+        if not affected or state.get("data_conflict_at"):
+            continue
+        conflict = affected[0]
+        if state["pending_decision_id"]:
+            conn.execute("""UPDATE paper_decisions SET status='cancelled',block_reason=?
+                WHERE mode=? AND decision_id=? AND status='pending'""",
+                (reason, mode, state["pending_decision_id"]))
+        state = _sync(conn, row, at)
+        state.update(data_conflict_at=conflict["observed_at"], block_reason=reason)
+        _write(conn, mode, row["plan_id"], state)
+        _event(conn, mode, row["plan_id"], "plan_data_quarantined", at,
+               {"ambiguous_observed_at": conflict["observed_at"], "reason": reason}, conflict["observed_at"])
+    conn.executemany("""INSERT OR IGNORE INTO paper_data_conflicts(mode,symbol,observed_at,reason)
+        VALUES(?,?,?,?)""", [(mode, symbol, observed, "late_ambiguous_quote") for symbol, observed in sorted(conflicts)])
 
 
 def cancel_exit_plan(conn, mode, plan_id, reason):
@@ -192,6 +262,7 @@ def cancel_exit_plan(conn, mode, plan_id, reason):
             conn.execute("UPDATE paper_decisions SET status='cancelled',block_reason='exit_plan_cancelled' WHERE mode=? AND decision_id=? AND status='pending'",
                          (mode, state["pending_decision_id"]))
         state.update(status="cancelled", pending_decision_id=None, block_reason=reason)
+        state.pop("deferred_trailing", None)
         _write(conn, mode, plan_id, state)
         _event(conn, mode, plan_id, "plan_cancelled", at, {"reason": reason, "remaining_quantity": state["remaining_quantity"]}, "cancel")
         return _view(conn.execute("SELECT * FROM paper_exit_plans WHERE mode=? AND plan_id=?", (mode, plan_id)).fetchone())
@@ -204,19 +275,19 @@ def evaluate(conn, q, cal):
     for row in rows:
         body = json.loads(row["payload"])
         at = p._stamp(q["observed"])
-        state = _sync(conn, row, at)
-        if state["status"] != "active":
+        state = _sync(conn, row, at, q["received_at"])
+        if state["status"] != "active" or state.get("data_conflict_at"):
             continue
         if q["exchange"] != state["exchange"]:
             continue
         if q["observed"] <= p._time(body["submitted_at"]) or (state["last_observed_at"] and q["observed"] <= p._time(state["last_observed_at"])):
             continue
+        # Leave legacy trackers absent: inventing a fresh empty history would
+        # forget their earlier evidence and defeat the conservative fallback.
+        if "_consumed_quote_keys" in state:
+            state["_consumed_quote_keys"].append(q["key"])
         state["last_observed_at"] = at
-        available = p._time(q["received_at"])
-        if state.get("information_available_at"):
-            available = max(available, p._time(state["information_available_at"]))
-        information_at = p._stamp(available)
-        state["information_available_at"] = information_at
+        information_at = _remember_information(state, q["received_at"])
         old_high = Decimal(state["high_water_mark"]) if state["high_water_mark"] is not None else None
         high = max(old_high, q["bid"]) if old_high is not None else q["bid"]
         state["high_water_mark"] = str(high)
@@ -226,10 +297,26 @@ def evaluate(conn, q, cal):
                 _event(conn, row["mode"], row["plan_id"], "trailing_activated", at,
                        {"bid": str(q["bid"]), "high_water_mark": str(high), "reference_price": str(reference)}, q["key"])
             state["trailing_active"] = True
+        stop = high * (1 - Decimal(trailing["distance_pct"])) if trailing and state["trailing_active"] else None
+        if (state["pending_decision_id"] and state["intent"]["kind"] == "stage" and
+                not state.get("deferred_trailing") and stop is not None and q["bid"] <= stop):
+            # Keep one child outstanding, but never lose a trailing crossing
+            # while a stage waits for liquidity. Quantity is fixed on promotion,
+            # after the stage's durable fill (if any) has reduced the remainder.
+            state["deferred_trailing"] = {"kind": "trailing", "trigger_at": at,
+                "trigger_bid": str(q["bid"]), "stop_level": str(stop), "high_water_mark": str(high),
+                "information_available_at": information_at}
+            _event(conn, row["mode"], row["plan_id"], "trailing_trigger_deferred", at,
+                   state["deferred_trailing"], q["key"])
         if not state["pending_decision_id"]:
             # A triggered intent is latched. A later T+1 unlock or liquidity retry
             # does not erase the original exit signal merely because price bounces.
-            stop = high * (1 - Decimal(trailing["distance_pct"])) if trailing and state["trailing_active"] else None
+            deferred = state.pop("deferred_trailing", None)
+            if deferred:
+                information_at = _remember_information(state, deferred.get("information_available_at"))
+                state["intent"] = {key: value for key, value in deferred.items() if key != "information_available_at"}
+                state["intent"]["quantity"] = state["remaining_quantity"]
+                _event(conn, row["mode"], row["plan_id"], "exit_triggered", at, state["intent"], q["key"])
             if stop is not None and q["bid"] <= stop and (not state["intent"] or state["intent"]["kind"] != "trailing"):
                 state["intent"] = {"kind": "trailing", "quantity": state["remaining_quantity"],
                                    "trigger_at": at, "trigger_bid": str(q["bid"]), "stop_level": str(stop),

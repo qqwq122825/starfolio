@@ -82,7 +82,7 @@ CNY cents. No corporate-action, dividends, tax-lot, financing or settlement mode
 import paper_exits
 from paper_exits import configure_exit_plan, cancel_exit_plan
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 import hashlib
 import json
@@ -226,6 +226,7 @@ def init_paper(conn):
         mode TEXT NOT NULL, symbol TEXT NOT NULL, price TEXT NOT NULL, observed_at TEXT NOT NULL,
         exchange TEXT NOT NULL, quote_key TEXT NOT NULL, PRIMARY KEY(mode,symbol))""",
         "CREATE INDEX IF NOT EXISTS paper_pending ON paper_decisions(mode,status,submitted_at)",
+        "CREATE INDEX IF NOT EXISTS paper_quote_history ON paper_quotes(mode,symbol,observed_at)",
     ]
     with _atomic(conn):
         for statement in statements + paper_exits.SCHEMA:
@@ -484,17 +485,41 @@ def _lots(conn, mode, symbol=None):
     return [dict(row) for row in conn.execute(query + " ORDER BY buy_date,id", args).fetchall()]
 
 
+def _quote_history_is_unambiguous(conn, mode, symbol, observed_at):
+    return conn.execute("SELECT COUNT(*) AS n FROM paper_quotes WHERE mode=? AND symbol=? AND observed_at=?",
+                        (mode, symbol, observed_at)).fetchone()["n"] == 1
+
+
+def _available_holding_mark(conn, mode, symbol, exchange, at, max_age):
+    """Use only historically received, unambiguous evidence available at fill time.
+
+    paper_marks is a presentation cache; its newest packet may arrive later than
+    a proposed historical fill. Search durable validated quotes instead.
+    """
+    rows = conn.execute("SELECT observed_at,payload FROM paper_quotes WHERE mode=? AND symbol=? AND observed_at BETWEEN ? AND ? ORDER BY observed_at DESC,quote_key",
+                        (mode, symbol, _stamp(at-timedelta(seconds=max_age)), _stamp(at))).fetchall()
+    for row in rows:
+        observed = _time(row["observed_at"])
+        age = (at - observed).total_seconds()
+        if age < 0 or age > max_age:
+            continue
+        raw = json.loads(row["payload"])
+        if raw.get("exchange") != exchange or _time(raw["received_at"]) > at:
+            continue
+        # A late conflict must never revive an older, more favorable valuation.
+        if not _quote_history_is_unambiguous(conn, mode, symbol, row["observed_at"]):
+            raise ValueError("fresh_marks_required_for_all_holdings")
+        return _num(raw["bid"], "bid", "0.00000001")
+    raise ValueError("fresh_marks_required_for_all_holdings")
+
+
 def _equity_for_buy(conn, account, q, config):
     equity = account["cash_cents"]
     exposure = 0
     for lot in _lots(conn, account["mode"]):
-        row = conn.execute("SELECT * FROM paper_marks WHERE mode=? AND symbol=?", (account["mode"], lot["symbol"])).fetchone()
-        if row is None or row["exchange"] != lot["exchange"]:
-            raise ValueError("fresh_marks_required_for_all_holdings")
-        age = (q["observed"] - _time(row["observed_at"])).total_seconds()
-        if age < 0 or age > config["max_quote_age_seconds"]:
-            raise ValueError("fresh_marks_required_for_all_holdings")
-        marked = _cents(Decimal(row["price"]) * lot["quantity"], ROUND_FLOOR)
+        price = _available_holding_mark(conn, account["mode"], lot["symbol"], lot["exchange"],
+                                        q["observed"], config["max_quote_age_seconds"])
+        marked = _cents(price * lot["quantity"], ROUND_FLOOR)
         equity += marked
         if lot["symbol"] == q["symbol"]:
             exposure += marked
@@ -606,6 +631,8 @@ def process_pending(conn, mode, quotes, session):
         for raw in quotes:
             try:
                 q = _quote(raw, mode, cal, as_of, config)
+                if any(lot["exchange"] != q["exchange"] for lot in _lots(conn, mode, q["symbol"])):
+                    raise ValueError("quote_exchange_position_mismatch")
                 if account["watermark"] and q["observed"] < _time(account["watermark"]):
                     raise ValueError("quote_predates_processed_clock")
                 parsed.append((q, raw))
@@ -626,6 +653,7 @@ def process_pending(conn, mode, quotes, session):
                 raise ValueError("quote_id reused with changed content")
             conn.execute("INSERT OR IGNORE INTO paper_quotes(quote_key,mode,symbol,observed_at,digest,payload) VALUES(?,?,?,?,?,?)",
                          (q["key"], mode, q["symbol"], _stamp(q["observed"]), digest, _json(raw)))
+        paper_exits.quarantine_ambiguous_history(conn, mode, _stamp(as_of))
         for observed in sorted({q["observed"] for q, raw in parsed}):
             group = [(q, raw) for q, raw in parsed if q["observed"] == observed]
             # Conflicting same-time executable quotes do not have a knowable ordering.
@@ -693,6 +721,13 @@ def paper_state(conn, mode):
     valuation_times = []
     for symbol, position in positions.items():
         mark = conn.execute("SELECT * FROM paper_marks WHERE mode=? AND symbol=?", (mode, symbol)).fetchone()
+        if mark and (any(lot["exchange"] != mark["exchange"] for lot in position["lots"]) or
+                     not _quote_history_is_unambiguous(conn, mode, symbol, mark["observed_at"])):
+            mark = None
+        if mark:
+            evidence = conn.execute("SELECT payload FROM paper_quotes WHERE quote_key=?", (mark["quote_key"],)).fetchone()
+            if evidence is None or _time(json.loads(evidence["payload"])["received_at"]) > valuation_clock:
+                mark = None
         position["cost"] = _money(position.pop("cost_cents"))
         position["average_cost"] = round(position["cost"] / position["quantity"], 6)
         position["mark_price"] = float(mark["price"]) if mark else None
@@ -714,7 +749,10 @@ def paper_state(conn, mode):
     calendars = [{"calendar_id": row["calendar_id"], "provenance": json.loads(row["payload"])["provenance"],
                   "independently_verified": False} for row in conn.execute("SELECT * FROM paper_calendars WHERE mode=? ORDER BY calendar_id", (mode,)).fetchall()]
     equity = _money(account["cash_cents"] + market_value) if all_marked else None
-    return {"mode": mode, "currency": "CNY", "initial_capital": _money(account["initial_cents"]),
+    conflicts = [dict(row) for row in conn.execute("SELECT mode,symbol,observed_at,reason FROM paper_data_conflicts WHERE mode=? ORDER BY rowid", (mode,))]
+    quality = {"data_conflicts": conflicts,
+               "data_quality_warning": "历史输入发生时间戳歧义；既有假设成交未追溯重写，受影响计划需取消后复核"} if conflicts else {}
+    return {**quality, "mode": mode, "currency": "CNY", "initial_capital": _money(account["initial_cents"]),
             "cash": _money(account["cash_cents"]), "market_value": _money(market_value) if all_marked else None,
             "equity": equity, "equity_is_current": bool(all_marked and fresh),
             "valuation_as_of": min(valuation_times) if valuation_times else None,
