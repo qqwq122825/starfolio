@@ -1,0 +1,51 @@
+# Local-only data, reports, secrets and development state
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+artifacts/
+python/data/
+
+# Dependencies and generated web output
+node_modules
+.npm-cache/
+.pnp.*
+.next/
+.vinext/
+dist/
+out/
+.wrangler/
+.sites-runtime/
+.vercel/
+*.tsbuildinfo
+web/next-env.d.ts
+
+# Machine-specific agent settings and personal exports
+.agents/
+.codex/
+.aws/
+outputs/
+work/
+*.zip
+*.tar.gz
+*.apk
+
+# A real deployment identity must never replace the tracked generic template
+web/.openai/hosting.local.json

@@ -1,0 +1,11 @@
+{
+  "mode": "imported",
+  "config": {
+    "commission_rate": 0.0003,
+    "minimum_commission": 5,
+    "sell_stamp_rate": 0.0005,
+    "transfer_rate": 1e-05,
+    "slippage_bps": 5,
+    "single_security_cap": 0.1
+  }
+}

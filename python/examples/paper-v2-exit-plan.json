@@ -1,0 +1,25 @@
+{
+  "plan_id": "demo-v2-exit",
+  "mode": "demo",
+  "symbol": "DEMO01",
+  "submitted_at": "2026-09-28T10:00:01+08:00",
+  "source": "user",
+  "reason": "虚构测试：分两批退出，其余按激活后的高水位回撤退出；参数未经验证",
+  "quantity": 600,
+  "reference_price": 10,
+  "stages": [
+    {
+      "gain_pct": 0.02,
+      "quantity": 100
+    },
+    {
+      "gain_pct": 0.04,
+      "quantity": 200
+    }
+  ],
+  "trailing": {
+    "activation_gain_pct": 0.02,
+    "distance_pct": 0.03
+  },
+  "test_only": true
+}

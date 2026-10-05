@@ -1,0 +1,14 @@
+{
+  "mode": "demo",
+  "symbol": "DEMO01",
+  "side": "buy",
+  "quantity": 600,
+  "submitted_at": "2026-09-28T10:00:00+08:00",
+  "evidence_at": "2026-09-28T10:00:00+08:00",
+  "source": "assistant",
+  "reason": "显式虚构 v2 回放建仓，只用于测试退出账本",
+  "thesis": "仅验证模拟账本，不代表真实行情判断",
+  "risks": "虚构报价与日历；无真实投资业绩意义",
+  "invalidation": "任何必要元数据缺失、数据过期、风险限制不通过则 HOLD",
+  "decision_id": "demo-v2-entry-600"
+}

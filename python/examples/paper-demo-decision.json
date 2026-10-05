@@ -1,0 +1,14 @@
+{
+  "mode": "demo",
+  "symbol": "DEMO01",
+  "side": "buy",
+  "quantity": 100,
+  "submitted_at": "2026-09-28T10:00:00+08:00",
+  "evidence_at": "2026-09-28T10:00:00+08:00",
+  "source": "assistant",
+  "reason": "虚构回放：演示以 100 股验证费用、风险上限和下一条报价成交；不是投资推荐",
+  "thesis": "仅验证模拟账本，不代表真实行情判断",
+  "risks": "虚构报价与日历；无真实投资业绩意义",
+  "invalidation": "任何必要元数据缺失、数据过期、风险限制不通过则 HOLD",
+  "decision_id": "demo-synthetic-buy-001"
+}

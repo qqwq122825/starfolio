@@ -1,0 +1,33 @@
+{
+  "mode": "demo",
+  "quotes": [
+    {
+      "quote_id": "2026-09-28-10:00:01",
+      "mode": "demo",
+      "symbol": "DEMO01",
+      "observed_at": "2026-09-28T10:00:01+08:00",
+      "received_at": "2026-09-28T10:00:01+08:00",
+      "source": "显式虚构 DEMO01 报价，仅供回放",
+      "source_url": "",
+      "provenance": "synthetic",
+      "exchange": "XSHG",
+      "currency": "CNY",
+      "instrument_type": "A_SHARE",
+      "market_status": "open",
+      "suspended": false,
+      "limit_state": "normal",
+      "lower_limit": 9,
+      "upper_limit": 11,
+      "price": 10,
+      "bid": 9.99,
+      "ask": 10.01,
+      "bid_size": 10000,
+      "ask_size": 10000
+    }
+  ],
+  "session": {
+    "calendar_id": "demo-fixture-v1",
+    "as_of": "2026-09-28T10:00:01+08:00",
+    "clock": "replay"
+  }
+}

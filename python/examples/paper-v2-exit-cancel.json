@@ -1,0 +1,5 @@
+{
+  "mode": "demo",
+  "plan_id": "demo-v2-exit",
+  "reason": "人工复核或修改计划前取消，保留已成交记录"
+}
