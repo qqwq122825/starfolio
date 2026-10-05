@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 import paper
+import daily_research
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / 'data' / 'watch.db'
@@ -495,7 +496,7 @@ def state(conn):
     news=[news_with_analysis(json.loads(r['payload'])) for r in conn.execute('SELECT payload FROM news WHERE mode=? ORDER BY published_at DESC LIMIT 100',(mode,))]
     runs=[dict(r) for r in conn.execute('SELECT * FROM runs WHERE mode=? ORDER BY id DESC LIMIT 12',(mode,))]
     events=[dict(r) for r in conn.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 20')]
-    return {'paper':paper.paper_state(conn,mode) if mode in paper.MODES else None,'mode':mode,'server_time':stamp(),'timezone':'Asia/Shanghai','watchlist':watch,'alerts':alerts,'news':news,'runs':runs,'audit':events,'portfolio':[dict(r) for r in conn.execute('SELECT * FROM portfolio')], 'digest':digest(conn,mode),'monitor':{'persistent':False,'description':'按需扫描；尚未部署常驻服务或外部通知通道','live_adapter':False,'broker_api':False,'freshness_minutes':MAX_AGE_MINUTES},'rule_version':RULE_VERSION}
+    return {'daily_research':daily_research.state(conn),'paper':paper.paper_state(conn,mode) if mode in paper.MODES else None,'mode':mode,'server_time':stamp(),'timezone':'Asia/Shanghai','watchlist':watch,'alerts':alerts,'news':news,'runs':runs,'audit':events,'portfolio':[dict(r) for r in conn.execute('SELECT * FROM portfolio')], 'digest':digest(conn,mode),'monitor':{'persistent':False,'description':'按需扫描；尚未部署常驻服务或外部通知通道','live_adapter':False,'broker_api':False,'freshness_minutes':MAX_AGE_MINUTES},'rule_version':RULE_VERSION}
 
 class Server(ThreadingHTTPServer):
     def __init__(self,address,db):
@@ -624,8 +625,15 @@ def main():
     for command in ('paper-decision','paper-calendar','paper-process','paper-config','paper-exit-plan','paper-exit-cancel'):
         parser=sub.add_parser(command);parser.add_argument('file')
     ps=sub.add_parser('paper-state');ps.add_argument('--mode',choices=sorted(paper.MODES),default='imported')
+    dr=sub.add_parser('daily-fetch',help='私有日线研究；不生成执行报价');dr.add_argument('--symbols',nargs='+',required=True);dr.add_argument('--days',type=int,default=60)
+    sub.add_parser('daily-status',help='只读日线来源状态')
     args=p.parse_args()
     conn=connect(args.db)
+    if args.command in ('daily-fetch','daily-status'):
+        result=daily_research.collect(conn,args.symbols,args.days) if args.command=='daily-fetch' else daily_research.state(conn)
+        print(json.dumps(result,ensure_ascii=False,indent=2))
+        conn.close()
+        return 0 if result['status']=='ok' else 1 if result['status']=='failed' else 2
     if args.command=='serve':
         if not args.empty and not conn.execute('SELECT 1 FROM snapshots LIMIT 1').fetchone():
             run_monitor(conn,'demo')
